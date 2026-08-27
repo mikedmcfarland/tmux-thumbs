@@ -200,13 +200,6 @@ impl<'a> Swapper<'a> {
 
     let active_pane_id = self.active_pane_id.as_mut().unwrap().clone();
 
-    let scroll_params =
-      if let (Some(pane_height), Some(scroll_position)) = (self.active_pane_height, self.active_pane_scroll_position) {
-        format!(" -S {} -E {}", -scroll_position, pane_height - scroll_position - 1)
-      } else {
-        "".to_string()
-      };
-
     let active_pane_zoomed = self.active_pane_zoomed.as_mut().unwrap().clone();
     let zoom_command = if active_pane_zoomed {
       format!("tmux resize-pane -t {} -Z;", active_pane_id)
@@ -214,10 +207,42 @@ impl<'a> Swapper<'a> {
       "".to_string()
     };
 
+    // Capture the pane here rather than inline in `pane_command`. That inline
+    // capture raced `swap_panes`, which moves the active pane into the
+    // full-size [thumbs] window: in a split window the pane grows from its
+    // own height to the window height, tmux pads the bottom with blank rows,
+    // and `tail -n <pre-swap height>` then reads only those blank rows. thumbs
+    // got an empty buffer, found no matches and exited 0 without drawing.
+    // Capturing before the window exists freezes the geometry measured in
+    // `capture_active_pane`.
+    let mut capture_command = vec![
+      "tmux".to_string(),
+      "capture-pane".to_string(),
+      "-J".to_string(),
+      "-t".to_string(),
+      active_pane_id.clone(),
+      "-p".to_string(),
+    ];
+
+    if let (Some(pane_height), Some(scroll_position)) = (self.active_pane_height, self.active_pane_scroll_position) {
+      capture_command.push("-S".to_string());
+      capture_command.push(format!("{}", -scroll_position));
+      capture_command.push("-E".to_string());
+      capture_command.push(format!("{}", pane_height - scroll_position - 1));
+    }
+
+    // Pane contents can be sensitive, so stage them in the per-user temp dir
+    // and have the spawned command unlink the file the moment `cat` has read
+    // it, rather than after the user picks a hint.
+    let capture = self.executor.execute(capture_command);
+    let capture_file = std::env::temp_dir().join(format!("thumbs-capture-{}", std::process::id()));
+
+    std::fs::write(&capture_file, capture).expect("Unable to write capture file");
+
     let pane_command = format!(
-        "tmux capture-pane -J -t {active_pane_id} -p{scroll_params} | tail -n {height} | {dir}/target/release/thumbs -f '%U:%H' -t {tmp} {args}; tmux swap-pane -t {active_pane_id}; {zoom_command} tmux wait-for -S {signal}",
+        "{{ cat {capture_file}; rm -f {capture_file}; }} | tail -n {height} | {dir}/target/release/thumbs -f '%U:%H' -t {tmp} {args}; tmux swap-pane -t {active_pane_id}; {zoom_command} tmux wait-for -S {signal}",
         active_pane_id = active_pane_id,
-        scroll_params = scroll_params,
+        capture_file = capture_file.display(),
         height = self.active_pane_height.unwrap_or(i32::MAX),
         dir = self.dir,
         tmp = TMP_FILE,
@@ -460,9 +485,12 @@ mod tests {
 
   #[test]
   fn swap_panes() {
+    // Popped back to front: active-pane list, `show -g`, `capture-pane`,
+    // `new-window`, `swap-pane`.
     let last_command_outputs = vec![
       "".to_string(),
       "%100".to_string(),
+      "captured pane contents".to_string(),
       "".to_string(),
       "%106:100:24:1:0:nope\n%98:100:24:1:0:active\n%107:100:24:1:0:nope\n".to_string(),
     ];
